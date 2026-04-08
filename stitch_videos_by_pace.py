@@ -15,7 +15,9 @@ Requirements:
 import argparse
 import hashlib
 import os
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 
 import cv2
@@ -135,7 +137,8 @@ def compute_audio_pace_score(path, sample_rate=22050, max_duration=30.0):
     transient_strength = float(np.mean(np.abs(np.diff(rms_values)))) if len(rms_values) > 1 else 0.0
     zero_crossings = np.abs(np.diff(np.signbit(mono_audio))).mean() if len(mono_audio) > 1 else 0.0
     loudness = float(rms_values.mean()) if len(rms_values) else 0.0
-    return loudness + (transient_strength * 2.0) + float(zero_crossings)
+    # Give stronger emphasis to audio energy and dynamics when ordering by pace.
+    return loudness + (transient_strength * 3.0) + float(zero_crossings)
 
 
 def ensure_even(value):
@@ -155,7 +158,42 @@ def get_output_size(video_plan, target_height):
     raise RuntimeError("No valid clip resolution available for stitched output.")
 
 
-def assign_repeat_count(score, min_score, max_score):
+def ffmpeg_concatenate_files(file_paths, output_path):
+    list_file = os.path.join(os.path.dirname(output_path), "ffmpeg_concat_list.txt")
+    with open(list_file, "w", encoding="utf-8") as listener:
+        for path in file_paths:
+            escaped_path = path.replace("'", "'\\''")
+            listener.write(f"file '{escaped_path}'\n")
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        list_file,
+        "-c",
+        "copy",
+        output_path,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg concat failed: "
+            + (result.stderr or result.stdout or "unknown error")
+        )
+
+
+def assign_repeat_count(score, duration, min_score, max_score, order_index=None, total_items=None):
+    if duration >= 20.0:
+        return 1
+
+    if duration < 10.0 and order_index is not None and total_items is not None:
+        if order_index >= total_items // 2:
+            return 4
+
     if max_score <= min_score:
         return 2
 
@@ -205,12 +243,20 @@ def build_stitch_plan(files):
             }
         )
 
-    plan.sort(key=lambda item: (item["pace_score"], item["duration"], item["path"]))
+    plan.sort(key=lambda item: (item["pace_score"], item["path"]))
     scores = [item["pace_score"] for item in plan]
     min_score = min(scores) if scores else 0.0
     max_score = max(scores) if scores else 0.0
-    for item in plan:
-        item["repeat_count"] = assign_repeat_count(item["pace_score"], min_score, max_score)
+    total_items = len(plan)
+    for index, item in enumerate(plan):
+        item["repeat_count"] = assign_repeat_count(
+            item["pace_score"],
+            item["duration"],
+            min_score,
+            max_score,
+            order_index=index,
+            total_items=total_items,
+        )
     return plan, skipped_paths
 
 
@@ -222,7 +268,7 @@ def render_stitched_video(plan, output_path, target_height=720, output_fps=30.0,
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    _, output_height = get_output_size(plan, target_height)
+    output_width, output_height = get_output_size(plan, target_height)
     loaded_clips = []
     skipped_paths = []
 
@@ -241,7 +287,8 @@ def render_stitched_video(plan, output_path, target_height=720, output_fps=30.0,
                         raise RuntimeError("clip duration too short")
 
                     processed_clip = source_clip.subclip(0, clip_end)
-                    processed_clip = processed_clip.resize(height=output_height)
+                    # Resize to even width and height for H.264 compatibility
+                    processed_clip = processed_clip.resize(newsize=(int(output_width), int(output_height)))
                     processed_clip = processed_clip.set_fps(output_fps)
                     loaded_clips.append(processed_clip)
                 except Exception as exc:
@@ -255,27 +302,64 @@ def render_stitched_video(plan, output_path, target_height=720, output_fps=30.0,
         if not loaded_clips:
             raise RuntimeError("Stitched output was empty after loading the clips.")
 
+        final_clip = None
         try:
-            final_clip = concatenate_videoclips(loaded_clips, method="compose")
-        except Exception as exc:
-            raise RuntimeError(f"Failed to concatenate clips: {exc}")
+            try:
+                final_clip = concatenate_videoclips(loaded_clips, method="chain")
+            except Exception as exc:
+                try:
+                    final_clip = concatenate_videoclips(loaded_clips, method="compose")
+                except Exception as exc2:
+                    raise RuntimeError(f"Failed to concatenate clips: {exc}; fallback compose failed: {exc2}")
 
-        try:
-            final_clip.write_videofile(
-                output_path,
-                fps=output_fps,
-                codec="libx264",
-                audio_codec="aac",
-                logger='bar',  # Show ffmpeg output
-                verbose=True,
-                threads=2,
-                preset='ultrafast',
-            )
+            try:
+                final_clip.write_videofile(
+                    output_path,
+                    fps=output_fps,
+                    codec="libx264",
+                    audio_codec="aac",
+                    logger='bar',  # Show ffmpeg output
+                    verbose=True,
+                    threads=2,
+                    preset='ultrafast',
+                    ffmpeg_params=[
+                        "-profile:v", "baseline",
+                        "-level", "3.0",
+                        "-pix_fmt", "yuv420p"
+                    ],
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed to write output video: {exc}")
+            total_duration = final_clip.duration or 0.0
+            final_clip.close()
+            return total_duration, skipped_paths
         except Exception as exc:
-            raise RuntimeError(f"Failed to write output video: {exc}")
-        total_duration = final_clip.duration or 0.0
-        final_clip.close()
-        return total_duration, skipped_paths
+            if final_clip is not None:
+                final_clip.close()
+            temp_paths = []
+            with tempfile.TemporaryDirectory(prefix="stitched_temp_") as temp_dir:
+                for index, clip in enumerate(loaded_clips):
+                    temp_path = os.path.join(temp_dir, f"clip_{index:04d}.mp4")
+                    clip.write_videofile(
+                        temp_path,
+                        fps=output_fps,
+                        codec="libx264",
+                        audio_codec="aac",
+                        logger=None,
+                        verbose=False,
+                        threads=2,
+                        preset='ultrafast',
+                        ffmpeg_params=[
+                            "-profile:v", "baseline",
+                            "-level", "3.0",
+                            "-pix_fmt", "yuv420p"
+                        ],
+                    )
+                    temp_paths.append(temp_path)
+                ffmpeg_concatenate_files(temp_paths, output_path)
+                with VideoFileClip(output_path) as output_clip:
+                    total_duration = output_clip.duration or 0.0
+            return total_duration, skipped_paths
     finally:
         for clip in loaded_clips:
             clip.close()

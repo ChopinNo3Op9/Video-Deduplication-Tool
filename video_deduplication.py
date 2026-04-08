@@ -23,7 +23,7 @@ try:
     import numpy as np
     from PIL import Image
     import imagehash
-    from moviepy import VideoFileClip
+    from moviepy.editor import VideoFileClip
 except ImportError as exc:
     print(f"Missing dependency: {exc}", file=sys.stderr)
     print("Install required packages with: pip install opencv-python pillow imagehash numpy moviepy", file=sys.stderr)
@@ -120,38 +120,58 @@ def collect_video_files(folder):
 
 
 def sample_audio_signature(path, sample_rate=8000, signature_length=64, max_duration=30.0):
-    with VideoFileClip(path) as clip:
-        audio = clip.audio
-        if audio is None:
+    try:
+        with VideoFileClip(path) as clip:
+            audio = clip.audio
+            if audio is None:
+                return None
+
+            analysis_duration = min(max_duration, clip.duration or 0.0)
+            if analysis_duration <= 0:
+                return None
+
+            def try_audio_duration(duration):
+                try:
+                    return audio.subclip(0, duration).to_soundarray(fps=sample_rate)
+                except Exception:
+                    return None
+
+            sound_array = try_audio_duration(analysis_duration)
+            if sound_array is None and analysis_duration > 1.0:
+                for duration in (min(10.0, analysis_duration), min(5.0, analysis_duration), min(2.0, analysis_duration), 1.0):
+                    sound_array = try_audio_duration(duration)
+                    if sound_array is not None:
+                        break
+
+        if not isinstance(sound_array, np.ndarray) or sound_array.size == 0:
             return None
 
-        analysis_duration = min(max_duration, clip.duration or 0.0)
-        if analysis_duration <= 0:
+        if sound_array.ndim > 1:
+            mono_audio = sound_array.mean(axis=1)
+        else:
+            mono_audio = sound_array
+
+        mono_audio = mono_audio.astype(np.float32)
+        if len(mono_audio) < 2:
             return None
 
-        sound_array = audio.subclipped(0, analysis_duration).to_soundarray(fps=sample_rate)
+        peak = float(np.max(np.abs(mono_audio)))
+        if peak > 0:
+            mono_audio = mono_audio / peak
 
-    if sound_array.size == 0:
+        if len(mono_audio) < signature_length:
+            mono_audio = np.pad(mono_audio, (0, signature_length - len(mono_audio)), mode='constant')
+
+        source_indexes = np.linspace(0, len(mono_audio) - 1, num=len(mono_audio), dtype=np.float32)
+        target_indexes = np.linspace(0, len(mono_audio) - 1, num=signature_length, dtype=np.float32)
+        sampled_waveform = np.interp(target_indexes, source_indexes, mono_audio)
+        envelope = np.abs(sampled_waveform)
+        if sampled_waveform.shape != envelope.shape:
+            return None
+        return np.concatenate([sampled_waveform, envelope]).tolist()
+    except Exception as exc:
+        print(f"Warning: error extracting audio signature for {path}: {exc}", file=sys.stderr)
         return None
-
-    if sound_array.ndim > 1:
-        mono_audio = sound_array.mean(axis=1)
-    else:
-        mono_audio = sound_array
-
-    mono_audio = mono_audio.astype(np.float32)
-    if len(mono_audio) < 2:
-        return None
-
-    peak = float(np.max(np.abs(mono_audio)))
-    if peak > 0:
-        mono_audio = mono_audio / peak
-
-    source_indexes = np.linspace(0, len(mono_audio) - 1, num=len(mono_audio), dtype=np.float32)
-    target_indexes = np.linspace(0, len(mono_audio) - 1, num=signature_length, dtype=np.float32)
-    sampled_waveform = np.interp(target_indexes, source_indexes, mono_audio)
-    envelope = np.abs(sampled_waveform)
-    return np.concatenate((sampled_waveform, envelope)).tolist()
 
 
 def find_exact_duplicates(files):

@@ -246,7 +246,8 @@ def compute_audio_pace_score(path, sample_rate=22050, max_duration=30.0):
     transient_strength = float(np.mean(np.abs(np.diff(rms_values)))) if len(rms_values) > 1 else 0.0
     zero_crossings = np.abs(np.diff(np.signbit(mono_audio))).mean() if len(mono_audio) > 1 else 0.0
     loudness = float(rms_values.mean()) if len(rms_values) else 0.0
-    return loudness + (transient_strength * 2.0) + float(zero_crossings)
+    # Give stronger emphasis to audio energy and dynamics when ordering by pace.
+    return loudness + (transient_strength * 3.0) + float(zero_crossings)
 
 
 def build_combine_plan(unique_files, max_clips=None):
@@ -277,7 +278,7 @@ def build_combine_plan(unique_files, max_clips=None):
             }
         )
 
-    combine_plan.sort(key=lambda item: (item["audio_pace"], item["duration"], item["path"]))
+    combine_plan.sort(key=lambda item: (item["audio_pace"], item["path"]))
     if max_clips and max_clips > 0:
         combine_plan = combine_plan[:max_clips]
     return combine_plan
